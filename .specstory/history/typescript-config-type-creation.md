@@ -74,7 +74,7 @@ _**Assistant**_
 
 The error occurs because the config file is in the root directory while index.ts is in the src directory. Let's move config.ts to the src directory.
 
-```bash
+```bash:src/index.ts
 mv config.ts src/config.ts
 ```
 

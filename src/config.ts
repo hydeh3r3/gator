@@ -49,8 +49,13 @@ export function readConfig(): Config {
   return validateConfig(rawConfig);
 }
 
-export function setUser(userName: string): void {
+export function getCurrentUser(): string | undefined {
   const config = readConfig();
-  config.currentUserName = userName;
+  return config.currentUserName;
+}
+
+export function setUser(username: string): void {
+  const config = readConfig();
+  config.currentUserName = username;
   writeConfig(config);
 }
