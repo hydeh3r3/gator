@@ -8,6 +8,20 @@
       "when": 1739794156950,
       "tag": "0000_fine_proemial_gods",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1740153136947,
+      "tag": "0001_harsh_silver_centurion",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1740153305045,
+      "tag": "0002_powerful_lyja",
+      "breakpoints": true
     }
   ]
 }
