@@ -1,8 +1,9 @@
 import { readConfig, setUser, getCurrentUser } from "./config.js";
 import { createUser, getUserByName, resetDatabase, getUsers } from "../lib/db/queries/users.js";
-import { fetchFeed } from "./feed.js";
-import { createFeed, getAllFeeds, getFeedByUrl, createFeedFollow, getFeedFollowsForUser } from "../lib/db/queries/feeds.js";
+import { fetchFeed, parseDuration, scrapeFeeds, handleError } from "./feed.js";
+import { createFeed, getAllFeeds, getFeedByUrl, createFeedFollow, getFeedFollowsForUser, deleteFeedFollow, getNextFeedToFetch, markFeedFetched } from "../lib/db/queries/feeds.js";
 import type { Feed, User } from "./schema.js";  
+import { getPostsForUser } from "../lib/db/queries/posts.js";
 
 type CommandHandler = (cmdName: string, ...args: string[]) => Promise<void>;
 type CommandsRegistry = Record<string, CommandHandler>;
@@ -79,12 +80,25 @@ async function handlerUsers(cmdName: string, ...args: string[]): Promise<void> {
 }
 
 async function handlerAgg(cmdName: string, ...args: string[]): Promise<void> {
-  if (args.length !== 0) {
-    throw new Error('Usage: agg');
+  if (args.length !== 1) {
+    throw new Error('Usage: agg <time_between_reqs>');
   }
-  
-  const feed = await fetchFeed('https://www.wagslane.dev/index.xml');
-  console.log(JSON.stringify(feed, null, 2));
+
+  const timeBetweenRequests = parseDuration(args[0]);
+  console.log(`Collecting feeds every ${args[0]}`);
+
+  scrapeFeeds().catch(handleError);
+  const interval = setInterval(() => {
+    scrapeFeeds().catch(handleError);
+  }, timeBetweenRequests);
+
+  await new Promise<void>((resolve) => {
+    process.on('SIGINT', () => {
+      console.log('Shutting down feed aggregator...');
+      clearInterval(interval);
+      resolve();
+    });
+  });
 }
 
 async function handlerAddFeed(cmdName: string, user: User, ...args: string[]): Promise<void> {
@@ -149,6 +163,16 @@ async function handlerFollowing(cmdName: string, user: User, ...args: string[]):
   }
 }
 
+async function handlerUnfollow(cmdName: string, user: User, ...args: string[]): Promise<void> {
+  if (args.length !== 1) {
+    throw new Error('Usage: unfollow <url>');
+  }
+
+  const url = args[0];
+  await deleteFeedFollow(user.id, url);
+  console.log(`Unfollowed feed: ${url}`);
+}
+
 function printFeed(feed: Feed, user: User): void {
   console.log('Feed Details:');
   console.log(`  Name: ${feed.name}`);
@@ -169,6 +193,31 @@ async function runCommand(registry: CommandsRegistry, cmdName: string, ...args: 
   await handler(cmdName, ...args);
 }
 
+async function handlerBrowse(cmdName: string, user: User, ...args: string[]): Promise<void> {
+  let limit = 2;
+  if (args.length === 1) {
+    limit = parseInt(args[0]);
+    if (isNaN(limit)) {
+      throw new Error('Limit must be a number');
+    }
+  } else if (args.length > 1) {
+    throw new Error('Usage: browse [limit]');
+  }
+
+  const posts = await getPostsForUser(user.id, limit);
+  if (posts.length === 0) {
+    console.log('No posts found');
+    return;
+  }
+
+  for (const post of posts) {
+    console.log(`\n${post.title} (${post.feedName})`);
+    console.log(post.description);
+    console.log(`Published: ${post.publishedAt}`);
+    console.log(`URL: ${post.url}`);
+  }
+}
+
 async function main() {
   const registry: CommandsRegistry = {};
   registerCommand(registry, 'login', handlerLogin);
@@ -180,6 +229,8 @@ async function main() {
   registerCommand(registry, 'feeds', handlerFeeds);
   registerCommand(registry, 'follow', middlewareLoggedIn(handlerFollow));
   registerCommand(registry, 'following', middlewareLoggedIn(handlerFollowing));
+  registerCommand(registry, 'unfollow', middlewareLoggedIn(handlerUnfollow));
+  registerCommand(registry, 'browse', middlewareLoggedIn(handlerBrowse));
 
   const args = process.argv.slice(2);
   

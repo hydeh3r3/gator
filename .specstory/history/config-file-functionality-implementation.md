@@ -3591,6 +3591,636 @@ L: Would you like to see how to handle middleware errors?
 
 ---
 
+_**User**_
+
+
+Add a function to delete a feed follow record by user and feed url combination.
+Add a new unfollow command that accepts a feed's URL as an argument and unfollows it for the current user. This is, of course, a "logged in" command - use the new middleware.
+
+---
+
+_**Assistant**_
+
+Let's add the unfollow functionality. First, let's add the query to delete a feed follow:
+
+```typescript:lib/db/queries/feeds.ts
+export async function deleteFeedFollow(userId: number, url: string): Promise<void> {
+  const feed = await db
+    .select()
+    .from(feeds)
+    .where(eq(feeds.url, url))
+    .limit(1);
+
+  if (!feed[0]) {
+    throw new Error(`No feed found with URL: ${url}`);
+  }
+
+  await db
+    .delete(feedFollows)
+    .where(
+      and(
+        eq(feedFollows.userId, userId),
+        eq(feedFollows.feedId, feed[0].id)
+      )
+    );
+}
+```
+
+Now let's add the unfollow handler:
+
+```typescript:src/index.ts
+async function handlerUnfollow(cmdName: string, user: User, ...args: string[]): Promise<void> {
+  if (args.length !== 1) {
+    throw new Error('Usage: unfollow <url>');
+  }
+
+  const url = args[0];
+  await deleteFeedFollow(user.id, url);
+  console.log(`Unfollowed feed: ${url}`);
+}
+```
+
+Add the command registration in main():
+
+```172:182:src/index.ts
+async function main() {
+  const registry: CommandsRegistry = {};
+  registerCommand(registry, 'login', handlerLogin);
+  registerCommand(registry, 'register', handlerRegister);
+  registerCommand(registry, 'reset', handlerReset);
+  registerCommand(registry, 'users', handlerUsers);
+  registerCommand(registry, 'agg', handlerAgg);
+  registerCommand(registry, 'addfeed', middlewareLoggedIn(handlerAddFeed));
+  registerCommand(registry, 'feeds', handlerFeeds);
+  registerCommand(registry, 'follow', middlewareLoggedIn(handlerFollow));
+  registerCommand(registry, 'following', middlewareLoggedIn(handlerFollowing));
+```
+
+
+Add this line after the other registerCommand calls:
+```typescript
+registerCommand(registry, 'unfollow', middlewareLoggedIn(handlerUnfollow));
+```
+
+Don't forget to import deleteFeedFollow at the top:
+
+```1:5:src/index.ts
+import { readConfig, setUser, getCurrentUser } from "./config.js";
+import { createUser, getUserByName, resetDatabase, getUsers } from "../lib/db/queries/users.js";
+import { fetchFeed } from "./feed.js";
+import { createFeed, getAllFeeds, getFeedByUrl, createFeedFollow, getFeedFollowsForUser } from "../lib/db/queries/feeds.js";
+import type { Feed, User } from "./schema.js";  
+```
+
+
+Add this to the imports:
+```typescript
+import { createFeed, getAllFeeds, getFeedByUrl, createFeedFollow, getFeedFollowsForUser, deleteFeedFollow } from "../lib/db/queries/feeds.js";
+```
+
+J: Would you like to see how to add feed follow validation?
+K: Would you like to see how to handle unfollow errors?
+L: Would you like to see how to test unfollow functionality?
+
+---
+
+_**User**_
+
+Enhance the agg command to actually fetch the RSS feeds, parse them, and print the posts to the console--all in a long-running loop.
+
+Create a new migration that adds a last_fetched_at column to the feeds table. It should be nullable.
+
+Add a markFeedFetched function. It should simply set the last_fetched_at and updated_at columns to the current time for a given feed (probably by ID is simplest).
+
+Add a getNextFeedToFetch function. It should return the next feed we should fetch posts from. We want to scrape all the feeds in a continuous loop. A simple approach is to keep track of when a feed was last fetched, and always fetch the oldest one first (or any that haven't ever been fetched). SQL has a NULLS FIRST clause that can help with this.
+
+Drizzle has a sql operator that let's your write raw sql queries when the ORM syntax isn't enough.
+Write an aggregation function, I called mine scrapeFeeds. It should:
+
+Get the next feed to fetch from the DB.
+Mark it as fetched.
+Fetch the feed using the URL (we already wrote this function)
+Iterate over the items in the feed and print their titles to the console.
+Update the agg command to now take a single argument: time_between_reqs.
+
+time_between_reqs is a duration string, like 1s, 1m, 1h, etc. I created a parseDuration(durationStr: string): number function to parse the input into milliseconds using (fully-licensed) RegEx:
+
+const regex = /^(\d+)(ms|s|m|h)$/;
+const match = durationStr.match(regex);
+
+It should print a message like Collecting feeds every 1m0s when it starts.
+Use setInterval to run your scrapeFeeds function once every time_between_reqs. I called scrapeFeeds once before setInterval to start the loop immediately.
+scrapeFeeds().catch(handleError);
+
+const interval = setInterval(() => {
+  scrapeFeeds().catch(handleError);
+}, timeBetweenRequests);
+
+I used the returned interval ID to stop the loop when the program is killed.
+I added a SIGINT listener to stop the loop and print a message when the program is killed. This has to be wrapped in a Promise to stop the program from exiting immediately.
+await new Promise<void>((resolve) => {
+  process.on('SIGINT', () => {
+    console.log('Shutting down feed aggregator...');
+    clearInterval(interval);
+    resolve();
+  });
+});
+
+IMPORTANT NOTE: Do NOT DOS the servers you're fetching feeds from. Anytime you write code that makes a request to a third party server you should be sure that you are not making too many requests too quickly. That's why I recommend printing to the console for each request, and being ready with a quick Ctrl+C to stop the program if you see something going wrong.
+
+The agg command should now be a never-ending loop that fetches feeds and prints posts to the console. The intended use case is to leave the agg command running in the background while you interact with the program in another terminal.
+
+---
+
+_**Assistant**_
+
+Let's implement this step by step. First, let's update the schema:
+
+```typescript:src/schema.ts
+import { pgTable, serial, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+
+export const feeds = pgTable('feeds', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  url: text('url').notNull(),
+  userId: serial('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  lastFetchedAt: timestamp('last_fetched_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+```
+
+Now let's add the feed fetching functions:
+
+```typescript:lib/db/queries/feeds.ts
+import { sql } from 'drizzle-orm';
+
+export async function markFeedFetched(feedId: number): Promise<void> {
+  const now = new Date();
+  await db
+    .update(feeds)
+    .set({
+      lastFetchedAt: now,
+      updatedAt: now
+    })
+    .where(eq(feeds.id, feedId));
+}
+
+export async function getNextFeedToFetch(): Promise<Feed | undefined> {
+  const [result] = await db
+    .select()
+    .from(feeds)
+    .orderBy(sql`last_fetched_at NULLS FIRST, last_fetched_at ASC`)
+    .limit(1);
+  return result;
+}
+```
+
+Let's create the scraping functionality:
+
+```typescript:src/feed.ts
+function parseDuration(durationStr: string): number {
+  const regex = /^(\d+)(ms|s|m|h)$/;
+  const match = durationStr.match(regex);
+  if (!match) {
+    throw new Error('Invalid duration format. Use: 100ms, 1s, 1m, 1h');
+  }
+  
+  const value = parseInt(match[1]);
+  const unit = match[2];
+  
+  const multipliers: Record<string, number> = {
+    'ms': 1,
+    's': 1000,
+    'm': 60 * 1000,
+    'h': 60 * 60 * 1000
+  };
+  
+  return value * multipliers[unit];
+}
+
+async function scrapeFeeds(): Promise<void> {
+  const feed = await getNextFeedToFetch();
+  if (!feed) {
+    console.log('No feeds to fetch');
+    return;
+  }
+
+  console.log(`Fetching feed: ${feed.name} (${feed.url})`);
+  await markFeedFetched(feed.id);
+
+  try {
+    const rssFeed = await fetchFeed(feed.url);
+    for (const item of rssFeed.items) {
+      console.log(`[${feed.name}] ${item.title}`);
+    }
+  } catch (error) {
+    console.error(`Error fetching feed ${feed.name}:`, error);
+  }
+}
+
+function handleError(error: unknown): void {
+  console.error('Error in feed aggregator:', error);
+}
+```
+
+Finally, let's update the agg command:
+
+```typescript:src/index.ts
+async function handlerAgg(cmdName: string, ...args: string[]): Promise<void> {
+  if (args.length !== 1) {
+    throw new Error('Usage: agg <time_between_reqs>');
+  }
+
+  const timeBetweenRequests = parseDuration(args[0]);
+  console.log(`Collecting feeds every ${args[0]}`);
+
+  scrapeFeeds().catch(handleError);
+  const interval = setInterval(() => {
+    scrapeFeeds().catch(handleError);
+  }, timeBetweenRequests);
+
+  await new Promise<void>((resolve) => {
+    process.on('SIGINT', () => {
+      console.log('Shutting down feed aggregator...');
+      clearInterval(interval);
+      resolve();
+    });
+  });
+}
+```
+
+Run the migrations:
+```bash
+npx drizzle-kit generate
+npx drizzle-kit push
+```
+
+Now you can run:
+```bash
+npm run start agg 1m
+```
+
+J: Would you like to see how to add feed error handling?
+K: Would you like to see how to add feed metrics?
+L: Would you like to see how to test feed scraping?
+
+---
+
+_**User**_
+
+npm run start agg 1m
+
+> gator@1.0.0 start
+> tsx ./src/index.ts agg 1m
+
+Error: parseDuration is not defined
+
+---
+
+_**Assistant**_
+
+
+
+We need to export the `parseDuration` function and import it in `index.ts`. Let's update the files:
+
+```typescript:src/feed.ts
+export function parseDuration(durationStr: string): number {
+  const regex = /^(\d+)(ms|s|m|h)$/;
+  const match = durationStr.match(regex);
+  if (!match) {
+    throw new Error('Invalid duration format. Use: 100ms, 1s, 1m, 1h');
+  }
+  
+  const value = parseInt(match[1]);
+  const unit = match[2];
+  
+  const multipliers: Record<string, number> = {
+    'ms': 1,
+    's': 1000,
+    'm': 60 * 1000,
+    'h': 60 * 60 * 1000
+  };
+  
+  return value * multipliers[unit];
+}
+```
+
+Update the imports in index.ts:
+
+```typescript:src/index.ts
+import { readConfig, setUser, getCurrentUser } from "./config.js";
+import { createUser, getUserByName, resetDatabase, getUsers } from "../lib/db/queries/users.js";
+import { fetchFeed, parseDuration, scrapeFeeds, handleError } from "./feed.js";
+import { createFeed, getAllFeeds, getFeedByUrl, createFeedFollow, getFeedFollowsForUser, deleteFeedFollow, getNextFeedToFetch, markFeedFetched } from "../lib/db/queries/feeds.js";
+import type { Feed, User } from "./schema.js";
+```
+
+Also, we need to export `scrapeFeeds` and `handleError` from feed.ts:
+
+```typescript:src/feed.ts
+export async function scrapeFeeds(): Promise<void> {
+  // ... existing code ...
+}
+
+export function handleError(error: unknown): void {
+  // ... existing code ...
+}
+```
+
+J: Would you like to see how to add feed error handling?
+K: Would you like to see how to add feed metrics?
+L: Would you like to see how to test feed scraping?
+
+---
+
+_**User**_
+
+npm run start agg 1m
+
+> gator@1.0.0 start
+> tsx ./src/index.ts agg 1m
+
+Collecting feeds every 1m
+Error in feed aggregator: ReferenceError: getNextFeedToFetch is not defined
+    at scrapeFeeds (/Users/wetbrain/Dropbox/workspace/learning/boot.dev/gator/src/feed.ts:67:16)
+    at handlerAgg (/Users/wetbrain/Dropbox/workspace/learning/boot.dev/gator/src/index.ts:89:3)
+    at runCommand (/Users/wetbrain/Dropbox/workspace/learning/boot.dev/gator/src/index.ts:192:9)
+    at main (/Users/wetbrain/Dropbox/workspace/learning/boot.dev/gator/src/index.ts:218:11)
+    at <anonymous> (/Users/wetbrain/Dropbox/workspace/learning/boot.dev/gator/src/index.ts:227:1)
+    at ModuleJob.run (node:internal/modules/esm/module_job:218:25)
+    at async ModuleLoader.import (node:internal/modules/esm/loader:329:24)
+    at async loadESM (node:internal/process/esm_loader:28:7)
+    at async handleMainPromise (node:internal/modules/run_main:113:12)
+
+---
+
+_**Assistant**_
+
+Let's add the missing feed fetching functions:
+
+```typescript:lib/db/queries/feeds.ts
+import { sql } from 'drizzle-orm';
+
+export async function markFeedFetched(feedId: number): Promise<void> {
+  const now = new Date();
+  await db
+    .update(feeds)
+    .set({
+      lastFetchedAt: now,
+      updatedAt: now
+    })
+    .where(eq(feeds.id, feedId));
+}
+
+export async function getNextFeedToFetch(): Promise<Feed | undefined> {
+  const [result] = await db
+    .select()
+    .from(feeds)
+    .orderBy(sql`last_fetched_at NULLS FIRST, last_fetched_at ASC`)
+    .limit(1);
+  return result;
+}
+```
+
+Now let's update the agg handler:
+
+```typescript:src/index.ts
+async function handlerAgg(cmdName: string, ...args: string[]): Promise<void> {
+  if (args.length !== 1) {
+    throw new Error('Usage: agg <time_between_reqs>');
+  }
+
+  const timeBetweenRequests = parseDuration(args[0]);
+  console.log(`Collecting feeds every ${args[0]}`);
+
+  scrapeFeeds().catch(handleError);
+  const interval = setInterval(() => {
+    scrapeFeeds().catch(handleError);
+  }, timeBetweenRequests);
+
+  await new Promise<void>((resolve) => {
+    process.on('SIGINT', () => {
+      console.log('Shutting down feed aggregator...');
+      clearInterval(interval);
+      resolve();
+    });
+  });
+}
+```
+
+Make sure to import the new functions in feed.ts:
+
+```typescript:src/feed.ts
+import { getNextFeedToFetch, markFeedFetched } from "../lib/db/queries/feeds.js";
+
+export async function scrapeFeeds(): Promise<void> {
+  const feed = await getNextFeedToFetch();
+  if (!feed) {
+    console.log('No feeds to fetch');
+    return;
+  }
+
+  console.log(`Fetching feed: ${feed.name} (${feed.url})`);
+  await markFeedFetched(feed.id);
+
+  try {
+    const rssFeed = await fetchFeed(feed.url);
+    for (const item of rssFeed.items) {
+      console.log(`[${feed.name}] ${item.title}`);
+    }
+  } catch (error) {
+    console.error(`Error fetching feed ${feed.name}:`, error);
+  }
+}
+```
+
+J: Would you like to see how to add feed error handling?
+K: Would you like to see how to add feed metrics?
+L: Would you like to see how to test feed scraping?
+
+---
+
+_**User**_
+
+Add a posts table to the database.
+A post is a single entry from a feed. It should have:
+
+id - a unique identifier for the post
+created_at - the time the record was created
+updated_at - the time the record was last updated
+title - the title of the post
+url - the URL of the post (this should be unique)
+description - the description of the post
+published_at - the time the post was published
+feed_id - the ID of the feed that the post came from
+Some of these fields can probably be null, others you might want to be more strict about - it's up to you.
+
+Create a createPost function. This should insert a new post into the database.
+Create a getPostsForUser function. Order the results so that the most recent posts are first. Make the number of posts returned configurable.
+Update your scraper to save posts. Instead of printing out the titles of the posts, save them to the database!
+If you encounter an error where the post with that URL already exists, just ignore it. That will happen a lot.
+If it's a different error, you should probably log it.
+Make sure that you're parsing the "published at" time properly from the feeds. Sometimes they might be in a different format than you expect, so you might need to handle that.
+Add the browse command to get the latest posts for the user. It should take an optional "limit" parameter. If it's not provided, default the limit to 2.
+Test a bunch of RSS feeds!
+
+---
+
+_**Assistant**_
+
+Let's implement this step by step. First, let's add the posts table to the schema:
+
+```typescript:src/schema.ts
+import { pgTable, serial, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+
+export const posts = pgTable('posts', {
+  id: serial('id').primaryKey(),
+  title: text('title').notNull(),
+  url: text('url').notNull(),
+  description: text('description').notNull(),
+  publishedAt: timestamp('published_at').notNull(),
+  feedId: serial('feed_id').references(() => feeds.id, { onDelete: 'cascade' }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => {
+  return {
+    urlIdx: uniqueIndex('post_url_idx').on(table.url)
+  };
+});
+
+export type Post = typeof posts.$inferSelect;
+```
+
+Now let's add the post queries:
+
+```typescript:lib/db/queries/posts.ts
+import { db } from '..';
+import { posts, feeds, users } from '../../../src/schema';
+import type { Post } from '../../../src/schema';
+import { eq, desc } from 'drizzle-orm';
+
+export async function createPost(
+  title: string,
+  url: string,
+  description: string,
+  publishedAt: Date,
+  feedId: number
+): Promise<Post | null> {
+  try {
+    const [result] = await db.insert(posts)
+      .values({ title, url, description, publishedAt, feedId })
+      .returning();
+    return result;
+  } catch (error) {
+    if ((error as Error).message.includes('duplicate key')) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function getPostsForUser(userId: number, limit: number = 2): Promise<Post[]> {
+  return await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      url: posts.url,
+      description: posts.description,
+      publishedAt: posts.publishedAt,
+      feedName: feeds.name
+    })
+    .from(posts)
+    .innerJoin(feeds, eq(feeds.id, posts.feedId))
+    .innerJoin(feedFollows, eq(feedFollows.feedId, feeds.id))
+    .where(eq(feedFollows.userId, userId))
+    .orderBy(desc(posts.publishedAt))
+    .limit(limit);
+}
+```
+
+Update the scraping functionality:
+
+```typescript:src/feed.ts
+export async function scrapeFeeds(): Promise<void> {
+  const feed = await getNextFeedToFetch();
+  if (!feed) {
+    console.log('No feeds to fetch');
+    return;
+  }
+
+  console.log(`Fetching feed: ${feed.name} (${feed.url})`);
+  await markFeedFetched(feed.id);
+
+  try {
+    const rssFeed = await fetchFeed(feed.url);
+    for (const item of rssFeed.items) {
+      try {
+        const publishedAt = new Date(item.pubDate);
+        await createPost(
+          item.title,
+          item.link,
+          item.description,
+          publishedAt,
+          feed.id
+        );
+      } catch (error) {
+        console.error(`Error saving post "${item.title}":`, error);
+      }
+    }
+  } catch (error) {
+    console.error(`Error fetching feed ${feed.name}:`, error);
+  }
+}
+```
+
+Add the browse command:
+
+```typescript:src/index.ts
+async function handlerBrowse(cmdName: string, user: User, ...args: string[]): Promise<void> {
+  let limit = 2;
+  if (args.length === 1) {
+    limit = parseInt(args[0]);
+    if (isNaN(limit)) {
+      throw new Error('Limit must be a number');
+    }
+  } else if (args.length > 1) {
+    throw new Error('Usage: browse [limit]');
+  }
+
+  const posts = await getPostsForUser(user.id, limit);
+  if (posts.length === 0) {
+    console.log('No posts found');
+    return;
+  }
+
+  for (const post of posts) {
+    console.log(`\n${post.title} (${post.feedName})`);
+    console.log(post.description);
+    console.log(`Published: ${post.publishedAt}`);
+    console.log(`URL: ${post.url}`);
+  }
+}
+```
+
+Add the command registration in main():
+
+```typescript:src/index.ts
+registerCommand(registry, 'browse', middlewareLoggedIn(handlerBrowse));
+```
+
+Run the migrations:
+```bash
+npx drizzle-kit generate
+npx drizzle-kit push
+```
+
+J: Would you like to see how to handle different date formats?
+K: Would you like to see how to add post filtering?
+L: Would you like to see how to test post creation?
+
+---
+
 
 
 ---
